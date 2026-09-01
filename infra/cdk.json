@@ -1,0 +1,14 @@
+{
+  "app": "go run .",
+  "context": {
+    "@aws-cdk/core:defaultCrossStackReferences": "strong",
+    "availability-zones:account=000000000000:region=us-east-1": [
+      "us-east-1a",
+      "us-east-1b"
+    ],
+    "availability-zones:account=000000000000:region=us-west-2": [
+      "us-west-2a",
+      "us-west-2b"
+    ]
+  }
+}

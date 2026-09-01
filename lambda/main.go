@@ -256,4 +256,3 @@ func envOr(k, def string) string {
 }
 
 func main() { lambda.Start(handler) }
-

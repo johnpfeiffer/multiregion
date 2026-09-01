@@ -1,14 +1,16 @@
 // Multi-region serverless POC:
-//   Global Accelerator -> ALB (per region) -> Lambda (Go) -> DynamoDB global table
+//
+//	Global Accelerator -> ALB (per region) -> Lambda (Go) -> DynamoDB global table
 //
 // Stack layout:
-//   RegionalStack  x2  (us-west-2 primary, us-east-1 secondary)
-//   EdgeStack      x1  (MUST be us-west-2 -- Global Accelerator's control plane
-//                       only accepts create/update in us-west-2)
+//
+//	RegionalStack  x2  (us-west-2 primary, us-east-1 secondary)
+//	EdgeStack      x1  (MUST be us-west-2 -- Global Accelerator's control plane
+//	                    only accepts create/update in us-west-2)
 //
 // Deploy order matters because the edge stack needs the secondary ALB ARN:
-//   1. cdk deploy Svc-usw2 Svc-use1
-//   2. cdk deploy Svc-edge -c albArnUsEast1=<arn from step 1 output>
+//  1. cdk deploy Svc-usw2 Svc-use1
+//  2. cdk deploy Svc-edge -c albArnUsEast1=<arn from step 1 output>
 package main
 
 import (
@@ -52,7 +54,8 @@ const (
 
 type RegionalStackProps struct {
 	awscdk.StackProps
-	IsPrimary bool
+	IsPrimary       bool
+	LambdaAssetPath string
 }
 
 type RegionalStack struct {
@@ -63,6 +66,10 @@ type RegionalStack struct {
 func NewRegionalStack(scope constructs.Construct, id string, props *RegionalStackProps) *RegionalStack {
 	stack := awscdk.NewStack(scope, jsii.String(id), &props.StackProps)
 	region := *stack.Region()
+	lambdaAssetPath := props.LambdaAssetPath
+	if lambdaAssetPath == "" {
+		lambdaAssetPath = "../lambda/build"
+	}
 
 	// -- Data ----------------------------------------------------------------
 	// Only the primary stack declares the table. TableV2 manages replicas via the
@@ -96,14 +103,14 @@ func NewRegionalStack(scope constructs.Construct, id string, props *RegionalStac
 	}
 
 	// -- Network -------------------------------------------------------------
-	// NatGateways: 0 is deliberate and saves ~$32/mo/AZ. An ALB Lambda target is
-	// invoked over the Lambda control plane, not the network -- the function is
-	// not in the VPC and needs no egress path. Public subnets only.
+	// The ALB is internal so Global Accelerator is the only public entry point.
+	// Lambda targets are invoked over the Lambda control plane, so neither the
+	// load balancer nor the function needs NAT-backed internet egress.
 	vpc := awsec2.NewVpc(stack, jsii.String("Vpc"), &awsec2.VpcProps{
 		MaxAzs:      jsii.Number(2),
 		NatGateways: jsii.Number(0),
 		SubnetConfiguration: &[]*awsec2.SubnetConfiguration{
-			{Name: jsii.String("public"), SubnetType: awsec2.SubnetType_PUBLIC, CidrMask: jsii.Number(24)},
+			{Name: jsii.String("application"), SubnetType: awsec2.SubnetType_PRIVATE_ISOLATED, CidrMask: jsii.Number(24)},
 		},
 	})
 
@@ -112,16 +119,15 @@ func NewRegionalStack(scope constructs.Construct, id string, props *RegionalStac
 		Runtime:      awslambda.Runtime_PROVIDED_AL2023(),
 		Architecture: awslambda.Architecture_ARM_64(),
 		Handler:      jsii.String("bootstrap"),
-		Code:         awslambda.Code_FromAsset(jsii.String("../lambda/build"), nil),
+		Code:         awslambda.Code_FromAsset(jsii.String(lambdaAssetPath), nil),
 		MemorySize:   jsii.Number(512),
 		Timeout:      awscdk.Duration_Seconds(jsii.Number(10)),
 		Environment: &map[string]*string{
 			"TABLE_NAME": jsii.String(tableName),
 			"PK_ATTR":    jsii.String(partitionKeyAttr),
 			"SK_ATTR":    jsii.String(sortKeyAttr),
-			// Flip to "false" to run the shallow-health-check variant of the
-			// experiment. See README: this single flag changes whether a
-			// data-layer failure is visible to Global Accelerator at all.
+			// Keep the data store in the endpoint health signal for this milestone.
+			// Shallow-vs-deep health experiments are deferred with failover testing.
 			"DEEP_HEALTH": jsii.String("true"),
 		},
 		LoggingFormat: awslambda.LoggingFormat_JSON,
@@ -144,7 +150,7 @@ func NewRegionalStack(scope constructs.Construct, id string, props *RegionalStac
 	// -- Edge (regional) -----------------------------------------------------
 	alb := elbv2.NewApplicationLoadBalancer(stack, jsii.String("Alb"), &elbv2.ApplicationLoadBalancerProps{
 		Vpc:            vpc,
-		InternetFacing: jsii.Bool(true),
+		InternetFacing: jsii.Bool(false),
 	})
 
 	// CRITICAL: health checks are DISABLED by default on Lambda target groups.
@@ -160,7 +166,7 @@ func NewRegionalStack(scope constructs.Construct, id string, props *RegionalStac
 			Enabled:                 jsii.Bool(true),
 			Path:                    jsii.String("/healthz"),
 			Interval:                awscdk.Duration_Seconds(jsii.Number(10)),
-			Timeout:                 jsii.Number(5),
+			Timeout:                 awscdk.Duration_Seconds(jsii.Number(5)),
 			HealthyThresholdCount:   jsii.Number(2),
 			UnhealthyThresholdCount: jsii.Number(2),
 			HealthyHttpCodes:        jsii.String("200"),
@@ -188,9 +194,8 @@ func NewRegionalStack(scope constructs.Construct, id string, props *RegionalStac
 
 type EdgeStackProps struct {
 	awscdk.StackProps
-	PrimaryAlb       elbv2.IApplicationLoadBalancer
-	SecondaryAlbArn  string // may be empty on first deploy
-	PreserveClientIp bool
+	PrimaryAlb      elbv2.IApplicationLoadBalancer
+	SecondaryAlbArn string // may be empty on first deploy
 }
 
 func NewEdgeStack(scope constructs.Construct, id string, props *EdgeStackProps) awscdk.Stack {
@@ -213,16 +218,13 @@ func NewEdgeStack(scope constructs.Construct, id string, props *EdgeStackProps) 
 
 	albOpts := &gaendpoints.ApplicationLoadBalancerEndpointOptions{
 		Weight: jsii.Number(128),
-		// Enabling this makes GA create managed ENIs + a security group inside
-		// your VPC. Handy for real client IPs; a well-known pain when tearing the
-		// stack down (the managed SG can block VPC deletion). Off for a POC --
-		// ALB already gives you X-Forwarded-For.
-		PreserveClientIp: jsii.Bool(props.PreserveClientIp),
+		// Internal ALB endpoints always use client IP preservation. Global
+		// Accelerator reaches them through managed ENIs in the VPC.
+		PreserveClientIp: jsii.Bool(true),
 	}
 
-	// TrafficDialPercentage is your best proving instrument: reversible, graduated,
-	// and it does not require breaking anything. Note it applies only to traffic GA
-	// had already routed to this group, not to all listener traffic.
+	// Both Regions are eligible for normal routing in this milestone. Deliberate
+	// traffic shifting and failover experiments are deferred.
 	listener.AddEndpointGroup(jsii.String("UsWest2"), &ga.EndpointGroupOptions{
 		Region:                jsii.String(primaryRegion),
 		TrafficDialPercentage: jsii.Number(100),
@@ -232,19 +234,19 @@ func NewEdgeStack(scope constructs.Construct, id string, props *EdgeStackProps) 
 	})
 
 	if props.SecondaryAlbArn != "" {
-		// Imported load balancers derive their Region from the ARN, which is how a
-		// us-west-2 stack legally references a us-east-1 ALB.
-		secondary := elbv2.ApplicationLoadBalancer_FromApplicationLoadBalancerAttributes(
-			stack, jsii.String("SecondaryAlb"),
-			&elbv2.ApplicationLoadBalancerAttributes{
-				LoadBalancerArn: jsii.String(props.SecondaryAlbArn),
-			},
-		)
-		listener.AddEndpointGroup(jsii.String("UsEast1"), &ga.EndpointGroupOptions{
-			Region:                jsii.String(secondaryRegion),
+		// The secondary ALB is owned by a stack in another Region. Represent its
+		// endpoint directly by ARN so the edge stack does not import or mutate the
+		// secondary VPC's security group.
+		ga.NewCfnEndpointGroup(stack, jsii.String("UsEast1"), &ga.CfnEndpointGroupProps{
+			EndpointGroupRegion:   jsii.String(secondaryRegion),
+			ListenerArn:           listener.ListenerArn(),
 			TrafficDialPercentage: jsii.Number(100),
-			Endpoints: &[]ga.IEndpoint{
-				gaendpoints.NewApplicationLoadBalancerEndpoint(secondary, albOpts),
+			EndpointConfigurations: []interface{}{
+				&ga.CfnEndpointGroup_EndpointConfigurationProperty{
+					EndpointId:                  jsii.String(props.SecondaryAlbArn),
+					ClientIpPreservationEnabled: jsii.Bool(true),
+					Weight:                      jsii.Number(128),
+				},
 			},
 		})
 	}
@@ -282,9 +284,8 @@ func main() {
 			Env:                   &awscdk.Environment{Account: account, Region: jsii.String(primaryRegion)},
 			CrossRegionReferences: jsii.Bool(true),
 		},
-		PrimaryAlb:       primary.Alb,
-		SecondaryAlbArn:  ctxOr(app, "albArnUsEast1", ""),
-		PreserveClientIp: false,
+		PrimaryAlb:      primary.Alb,
+		SecondaryAlbArn: ctxOr(app, "albArnUsEast1", ""),
 	})
 
 	app.Synth(nil)
@@ -304,4 +305,3 @@ func mustCtx(app awscdk.App, key string) string {
 	}
 	return v
 }
-

@@ -1,0 +1,7 @@
+{
+  "name": "mrpoc-infra",
+  "private": true,
+  "devDependencies": {
+    "aws-cdk": "2.1139.0"
+  }
+}

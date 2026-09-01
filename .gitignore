@@ -19,6 +19,13 @@ profile.cov
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
+infra/node_modules/
+infra/cdk.context.json
+.cache/
+
+# Generated build and deployment artifacts
+lambda/build/
+infra/cdk.out/
 
 # Go workspace file
 go.work
@@ -30,3 +37,4 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+.DS_Store

@@ -8,7 +8,9 @@ import (
 	"github.com/aws/jsii-runtime-go"
 )
 
-func TestRegionalStackUsesInternalLoadBalancer(t *testing.T) {
+const testCertificateArn = "arn:aws:acm:us-west-2:000000000000:certificate/test"
+
+func TestRegionalStackUsesPrivateGlobalAcceleratorEndpoint(t *testing.T) {
 	app := awscdk.NewApp(nil)
 	stack := NewRegionalStack(app, "TestRegional", &RegionalStackProps{
 		StackProps: awscdk.StackProps{
@@ -18,11 +20,24 @@ func TestRegionalStackUsesInternalLoadBalancer(t *testing.T) {
 			},
 		},
 		LambdaAssetPath: t.TempDir(),
+		CertificateArn:  testCertificateArn,
 	})
 
 	template := assertions.Template_FromStack(stack.Stack, nil)
 	template.HasResourceProperties(jsii.String("AWS::ElasticLoadBalancingV2::LoadBalancer"), map[string]any{
 		"Scheme": "internal",
+	})
+	template.HasResourceProperties(jsii.String("AWS::ElasticLoadBalancingV2::Listener"), map[string]any{
+		"Port":      443,
+		"Protocol":  "HTTPS",
+		"SslPolicy": "ELBSecurityPolicy-TLS13-1-2-2021-06",
+		"Certificates": []any{
+			map[string]any{"CertificateArn": testCertificateArn},
+		},
+	})
+	template.ResourceCountIs(jsii.String("AWS::EC2::InternetGateway"), jsii.Number(1))
+	template.HasResourceProperties(jsii.String("AWS::EC2::VPCGatewayAttachment"), map[string]any{
+		"InternetGatewayId": map[string]any{"Ref": assertions.Match_AnyValue()},
 	})
 }
 
@@ -37,6 +52,7 @@ func TestPrimaryStackSynthesizesMRSCGlobalTable(t *testing.T) {
 		},
 		IsPrimary:       true,
 		LambdaAssetPath: t.TempDir(),
+		CertificateArn:  testCertificateArn,
 	})
 
 	template := assertions.Template_FromStack(stack.Stack, nil)
@@ -58,6 +74,7 @@ func TestEdgeEndpointPreservesClientIP(t *testing.T) {
 			},
 		},
 		LambdaAssetPath: t.TempDir(),
+		CertificateArn:  testCertificateArn,
 	})
 	edge := NewEdgeStack(app, "TestEdge", &EdgeStackProps{
 		StackProps: awscdk.StackProps{
@@ -72,6 +89,12 @@ func TestEdgeEndpointPreservesClientIP(t *testing.T) {
 	})
 
 	template := assertions.Template_FromStack(edge, nil)
+	template.HasResourceProperties(jsii.String("AWS::GlobalAccelerator::Listener"), map[string]any{
+		"Protocol": "TCP",
+		"PortRanges": []any{
+			map[string]any{"FromPort": 443, "ToPort": 443},
+		},
+	})
 	template.ResourceCountIs(jsii.String("AWS::GlobalAccelerator::EndpointGroup"), jsii.Number(2))
 	template.HasResourceProperties(jsii.String("AWS::GlobalAccelerator::EndpointGroup"), map[string]any{
 		"EndpointConfigurations": []any{

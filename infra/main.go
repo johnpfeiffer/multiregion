@@ -56,6 +56,7 @@ type RegionalStackProps struct {
 	awscdk.StackProps
 	IsPrimary       bool
 	LambdaAssetPath string
+	CertificateArn  string
 }
 
 type RegionalStack struct {
@@ -66,6 +67,9 @@ type RegionalStack struct {
 func NewRegionalStack(scope constructs.Construct, id string, props *RegionalStackProps) *RegionalStack {
 	stack := awscdk.NewStack(scope, jsii.String(id), &props.StackProps)
 	region := *stack.Region()
+	if props.CertificateArn == "" {
+		panic(fmt.Sprintf("%s requires an ACM certificate ARN", id))
+	}
 	lambdaAssetPath := props.LambdaAssetPath
 	if lambdaAssetPath == "" {
 		lambdaAssetPath = "../lambda/build"
@@ -112,6 +116,14 @@ func NewRegionalStack(scope constructs.Construct, id string, props *RegionalStac
 		SubnetConfiguration: &[]*awsec2.SubnetConfiguration{
 			{Name: jsii.String("application"), SubnetType: awsec2.SubnetType_PRIVATE_ISOLATED, CidrMask: jsii.Number(24)},
 		},
+	})
+	// Global Accelerator requires an internet gateway to be attached to the VPC
+	// for an internal ALB endpoint. The isolated subnets intentionally have no
+	// route to it, so the ALB remains private and GA remains the only front door.
+	internetGateway := awsec2.NewCfnInternetGateway(stack, jsii.String("InternetGateway"), &awsec2.CfnInternetGatewayProps{})
+	awsec2.NewCfnVPCGatewayAttachment(stack, jsii.String("InternetGatewayAttachment"), &awsec2.CfnVPCGatewayAttachmentProps{
+		VpcId:             vpc.VpcId(),
+		InternetGatewayId: internetGateway.Ref(),
 	})
 
 	// -- Compute -------------------------------------------------------------
@@ -173,10 +185,14 @@ func NewRegionalStack(scope constructs.Construct, id string, props *RegionalStac
 		},
 	})
 
-	listener := alb.AddListener(jsii.String("Http"), &elbv2.BaseApplicationListenerProps{
-		Port:     jsii.Number(80), // POC. Real: 443 + ACM cert per region.
-		Protocol: elbv2.ApplicationProtocol_HTTP,
-		Open:     jsii.Bool(true),
+	listener := alb.AddListener(jsii.String("Https"), &elbv2.BaseApplicationListenerProps{
+		Port:     jsii.Number(443),
+		Protocol: elbv2.ApplicationProtocol_HTTPS,
+		Certificates: &[]elbv2.IListenerCertificate{
+			elbv2.ListenerCertificate_FromArn(jsii.String(props.CertificateArn)),
+		},
+		SslPolicy: elbv2.SslPolicy_RECOMMENDED_TLS,
+		Open:      jsii.Bool(true),
 	})
 	listener.AddTargetGroups(jsii.String("Default"), &elbv2.AddApplicationTargetGroupsProps{
 		TargetGroups: &[]elbv2.IApplicationTargetGroup{tg},
@@ -206,10 +222,11 @@ func NewEdgeStack(scope constructs.Construct, id string, props *EdgeStackProps) 
 		Enabled:         jsii.Bool(true),
 	})
 
-	listener := accel.AddListener(jsii.String("Http"), &ga.ListenerOptions{
+	listener := accel.AddListener(jsii.String("Https"), &ga.ListenerOptions{
 		PortRanges: &[]*ga.PortRange{
-			{FromPort: jsii.Number(80), ToPort: jsii.Number(80)},
+			{FromPort: jsii.Number(443), ToPort: jsii.Number(443)},
 		},
+		Protocol: ga.ConnectionProtocol_TCP,
 		// NONE means every new connection is routed independently. SOURCE_IP pins
 		// a client to an endpoint, which will make your failover measurements
 		// noisier and slower to converge. Keep NONE for the experiment.
@@ -262,13 +279,16 @@ func main() {
 	app := awscdk.NewApp(nil)
 
 	account := jsii.String(mustCtx(app, "account"))
+	certArnUsWest2 := mustCtx(app, "certArnUsWest2")
+	certArnUsEast1 := mustCtx(app, "certArnUsEast1")
 
 	primary := NewRegionalStack(app, "Svc-usw2", &RegionalStackProps{
 		StackProps: awscdk.StackProps{
 			Env:                   &awscdk.Environment{Account: account, Region: jsii.String(primaryRegion)},
 			CrossRegionReferences: jsii.Bool(true),
 		},
-		IsPrimary: true,
+		IsPrimary:      true,
+		CertificateArn: certArnUsWest2,
 	})
 
 	NewRegionalStack(app, "Svc-use1", &RegionalStackProps{
@@ -276,7 +296,8 @@ func main() {
 			Env:                   &awscdk.Environment{Account: account, Region: jsii.String(secondaryRegion)},
 			CrossRegionReferences: jsii.Bool(true),
 		},
-		IsPrimary: false,
+		IsPrimary:      false,
+		CertificateArn: certArnUsEast1,
 	})
 
 	NewEdgeStack(app, "Svc-edge", &EdgeStackProps{

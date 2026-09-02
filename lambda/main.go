@@ -53,7 +53,14 @@ func init() {
 		initErr = err
 		return
 	}
-	ddb = dynamodb.NewFromConfig(cfg)
+
+	var options []func(*dynamodb.Options)
+	if endpoint := os.Getenv("DYNAMODB_ENDPOINT"); endpoint != "" {
+		options = append(options, func(o *dynamodb.Options) {
+			o.BaseEndpoint = aws.String(endpoint)
+		})
+	}
+	ddb = dynamodb.NewFromConfig(cfg, options...)
 }
 
 type item struct {

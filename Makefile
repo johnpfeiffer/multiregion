@@ -8,15 +8,25 @@ ACTUAL_ACCOUNT  = $(shell aws sts get-caller-identity --region $(PRIMARY) --quer
 AWS_ACCOUNT     = $(if $(strip $(ACCOUNT)),$(strip $(ACCOUNT)),$(ACTUAL_ACCOUNT))
 CDK             := ./node_modules/.bin/cdk
 JSII_RUNTIME_PACKAGE_CACHE_ROOT ?= $(CURDIR)/.cache/jsii
+DYNAMODB_ENDPOINT ?= http://localhost:8000
+LOCAL_TABLE       ?= mrpoc-items-local
+LOCAL_REGION      ?= us-west-2
+DOMAIN_NAME       ?= www.kittyandbear.com
+CERT_ARN_USW2     ?= arn:aws:acm:us-west-2:067872803572:certificate/d3fe4d63-b8ec-4776-8f6c-6b4374832416
+CERT_ARN_USE1     ?= arn:aws:acm:us-east-1:067872803572:certificate/cd0d5b68-5dc1-4b41-b138-ad54dc522ba6
+CERT_CONTEXT       = -c certArnUsWest2=$(CERT_ARN_USW2) -c certArnUsEast1=$(CERT_ARN_USE1)
 export JSII_RUNTIME_PACKAGE_CACHE_ROOT
 
 .PHONY: help setup deps lambda-deps infra-deps node-deps build test fmt synth \
-	check-aws bootstrap deploy deploy-regions deploy-edge accel-dns clean
+	local-up local-down local-logs test-integration check-aws bootstrap deploy \
+	deploy-regions deploy-edge accel-dns accel-ips clean
 
 help:
 	@echo "Local:   make setup | make build | make test | make synth"
-	@echo "AWS:     make bootstrap | make deploy | make accel-dns"
+	@echo "Dynamo:  make local-up | make test-integration | make local-down"
+	@echo "AWS:     make bootstrap | make deploy | make accel-dns | make accel-ips"
 	@echo "Options: AWS_PROFILE=<profile> ACCOUNT=<12-digit-account-id>"
+	@echo "HTTPS:   $(DOMAIN_NAME) (override CERT_ARN_USW2 / CERT_ARN_USE1 if needed)"
 
 setup: deps
 
@@ -43,12 +53,31 @@ test: lambda-deps infra-deps
 	cd lambda && go test ./...
 	cd infra && go test .
 
+local-up:
+	docker compose up -d dynamodb-local
+
+local-down:
+	docker compose down
+
+local-logs:
+	docker compose logs -f dynamodb-local
+
+test-integration: local-up lambda-deps
+	cd lambda && \
+		AWS_REGION=$(LOCAL_REGION) \
+		AWS_ACCESS_KEY_ID=local \
+		AWS_SECRET_ACCESS_KEY=local \
+		AWS_EC2_METADATA_DISABLED=true \
+		TABLE_NAME=$(LOCAL_TABLE) \
+		DYNAMODB_ENDPOINT=$(DYNAMODB_ENDPOINT) \
+		go test -tags=integration -count=1 .
+
 fmt:
-	gofmt -w infra/main.go infra/main_test.go lambda/main.go
+	gofmt -w infra/main.go infra/main_test.go lambda/main.go lambda/main_integration_test.go
 
 # Synthesis is credential-free by default. Override SYNTH_ACCOUNT if desired.
 synth: build infra-deps node-deps
-	cd infra && $(CDK) synth -c account=$(SYNTH_ACCOUNT)
+	cd infra && $(CDK) synth -c account=$(SYNTH_ACCOUNT) $(CERT_CONTEXT)
 
 check-aws:
 	@command -v aws >/dev/null || { echo "AWS CLI v2 is required for this target"; exit 1; }
@@ -57,10 +86,11 @@ check-aws:
 		echo "ACCOUNT=$(ACCOUNT) does not match the authenticated account $(ACTUAL_ACCOUNT)"; exit 1; }
 
 bootstrap: check-aws node-deps
-	cd infra && $(CDK) bootstrap aws://$(AWS_ACCOUNT)/$(PRIMARY) aws://$(AWS_ACCOUNT)/$(SECOND)
+	cd infra && $(CDK) bootstrap aws://$(AWS_ACCOUNT)/$(PRIMARY) aws://$(AWS_ACCOUNT)/$(SECOND) \
+		-c account=$(AWS_ACCOUNT) $(CERT_CONTEXT)
 
 deploy-regions: check-aws build infra-deps node-deps
-	cd infra && $(CDK) deploy Svc-usw2 Svc-use1 -c account=$(AWS_ACCOUNT) --require-approval never
+	cd infra && $(CDK) deploy Svc-usw2 Svc-use1 -c account=$(AWS_ACCOUNT) $(CERT_CONTEXT) --require-approval never
 
 # Two phases are intentional: the edge stack needs the secondary ALB ARN.
 deploy-edge: check-aws build infra-deps node-deps
@@ -75,7 +105,8 @@ deploy-edge: check-aws build infra-deps node-deps
 		echo "Svc-use1 returned an invalid ALB ARN: $$alb_arn"; exit 1; \
 	fi; \
 	cd infra; \
-	$(CDK) deploy Svc-edge -c account=$(AWS_ACCOUNT) -c albArnUsEast1="$$alb_arn" --require-approval never
+	$(CDK) deploy Svc-edge -c account=$(AWS_ACCOUNT) $(CERT_CONTEXT) \
+		-c albArnUsEast1="$$alb_arn" --require-approval never
 
 deploy:
 	$(MAKE) deploy-regions
@@ -84,6 +115,10 @@ deploy:
 accel-dns: check-aws
 	@aws globalaccelerator list-accelerators --region $(PRIMARY) \
 		--query "Accelerators[?Name=='mrpoc'].DnsName" --output text
+
+accel-ips: check-aws
+	@aws globalaccelerator list-accelerators --region $(PRIMARY) \
+		--query "Accelerators[?Name=='mrpoc'].IpSets[].IpAddresses[]" --output text
 
 clean:
 	rm -rf lambda/build infra/cdk.out

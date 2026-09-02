@@ -8,7 +8,7 @@ client -> Global Accelerator TCP/443 -> private ALB HTTPS/443 -> Go Lambda -> Dy
 
 - Application Regions: `us-west-2` and `us-east-1`
 - DynamoDB witness Region: `us-east-2`
-- HTTPS hostname: `www.kittyandbear.com`
+- HTTPS hostname: `www.example.com`
 - Public entry point: Global Accelerator only
 - Current scope: build, deploy, and write data
 - Deferred scope: automated failover/failback experiments and production hardening
@@ -106,8 +106,8 @@ go mod download
 npm ci
 ./node_modules/.bin/cdk synth \
   -c account=000000000000 \
-  -c certArnUsWest2=arn:aws:acm:us-west-2:067872803572:certificate/d3fe4d63-b8ec-4776-8f6c-6b4374832416 \
-  -c certArnUsEast1=arn:aws:acm:us-east-1:067872803572:certificate/cd0d5b68-5dc1-4b41-b138-ad54dc522ba6
+  -c certArnUsWest2=arn:aws:acm:us-west-2:ACCOUNT_ID:certificate/CERTIFICATE_ID \
+  -c certArnUsEast1=arn:aws:acm:us-east-1:ACCOUNT_ID:certificate/CERTIFICATE_ID
 ```
 
 The local integration path can also be run manually:
@@ -132,12 +132,12 @@ make clean
 
 ## Deploy
 
-The Makefile defaults to the existing wildcard certificates:
+The Makefile supplies the deployment-specific wildcard certificates through these variables:
 
-- `us-west-2`: `arn:aws:acm:us-west-2:067872803572:certificate/d3fe4d63-b8ec-4776-8f6c-6b4374832416`
-- `us-east-1`: `arn:aws:acm:us-east-1:067872803572:certificate/cd0d5b68-5dc1-4b41-b138-ad54dc522ba6`
+- `us-west-2`: `CERT_ARN_USW2`
+- `us-east-1`: `CERT_ARN_USE1`
 
-Both certificates are issued for `*.kittyandbear.com`, which covers `www.kittyandbear.com`. Override `CERT_ARN_USW2` or `CERT_ARN_USE1` on the `make` command if the certificates are replaced.
+For this generalized example, both certificates must cover `www.example.com`; a certificate for `*.example.com` does. Override `CERT_ARN_USW2` or `CERT_ARN_USE1` on the `make` command if the deployment-specific certificates are replaced.
 
 Bootstrap the two Regions that contain CloudFormation stacks. This is normally required once per account and Region:
 
@@ -159,7 +159,7 @@ Get the Global Accelerator hostname:
 AWS_PROFILE=my-profile make accel-dns
 ```
 
-The active AWS account does not contain a Route 53 hosted zone for `kittyandbear.com`, so public DNS is not changed by this project. At the domain's authoritative DNS provider, create a CNAME from `www.kittyandbear.com` to the accelerator hostname returned by `make accel-dns`. If the provider requires address records instead, retrieve Global Accelerator's static addresses with:
+Public DNS is managed outside this project. At the domain's authoritative DNS provider, create a CNAME from `www.example.com` to the accelerator hostname returned by `make accel-dns`. If the provider requires address records instead, retrieve Global Accelerator's static addresses with:
 
 ```sh
 AWS_PROFILE=my-profile make accel-ips
@@ -172,7 +172,7 @@ Then create an A record for each returned address.
 Write an item through Global Accelerator:
 
 ```sh
-curl -i -X POST "https://www.kittyandbear.com/items" \
+curl -i -X POST "https://www.example.com/items" \
   -H 'Content-Type: application/json' \
   -d '{"id":"demo","seq":1,"payload":"hello"}'
 ```
@@ -180,7 +180,7 @@ curl -i -X POST "https://www.kittyandbear.com/items" \
 Read the item through Global Accelerator:
 
 ```sh
-curl -i "https://www.kittyandbear.com/items?id=demo"
+curl -i "https://www.example.com/items?id=demo"
 ```
 
 The responses include `X-Served-By`, which identifies the AWS Region that handled each request.
@@ -188,11 +188,12 @@ The responses include `X-Served-By`, which identifies the AWS Region that handle
 To test before the `www` CNAME has propagated, resolve the HTTPS hostname to one of the accelerator's current IP addresses for this request only:
 
 ```sh
-curl -i "https://www.kittyandbear.com/items?id=demo" \
-  --resolve "www.kittyandbear.com:443:$(dig +short ac7649bf9cd8b2519.awsglobalaccelerator.com | head -1)"
+ACCELERATOR_DNS="$(AWS_PROFILE=my-profile make accel-dns)"
+curl -i "https://www.example.com/items?id=demo" \
+  --resolve "www.example.com:443:$(dig +short "$ACCELERATOR_DNS" | head -1)"
 ```
 
-`--resolve` preserves `www.kittyandbear.com` for TLS certificate validation and HTTP routing while bypassing normal DNS resolution locally.
+`--resolve` preserves `www.example.com` for TLS certificate validation and HTTP routing while bypassing normal DNS resolution locally.
 
 Verify the stored items directly against the `us-west-2` DynamoDB replica:
 
@@ -220,7 +221,7 @@ Change `--region` to `us-east-1` to inspect the other replica.
 ## Notes
 
 - Public requests use HTTPS, with TLS 1.2 or 1.3 terminated independently at each regional ALB.
-- The authoritative DNS record for `www.kittyandbear.com` is external to this CDK application.
+- The authoritative DNS record for `www.example.com` is external to this CDK application.
 - The API is intentionally minimal and unauthenticated.
 - The DynamoDB table has a destroy removal policy. Treat deployed data as disposable.
 - Global Accelerator, two ALBs, Lambda invocations, and DynamoDB usage can incur AWS charges.

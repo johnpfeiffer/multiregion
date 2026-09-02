@@ -19,12 +19,15 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -42,6 +45,7 @@ var (
 	pkAttr     = envOr("PK_ATTR", "id")
 	skAttr     = envOr("SK_ATTR", "occurred_at")
 	deepHealth = envOr("DEEP_HEALTH", "true") == "true"
+	apiToken   = os.Getenv("API_TOKEN")
 	initErr    error
 )
 
@@ -72,16 +76,52 @@ type item struct {
 }
 
 func handler(ctx context.Context, req events.ALBTargetGroupRequest) (events.ALBTargetGroupResponse, error) {
-	switch {
-	case req.Path == "/healthz":
+	if req.Path == "/healthz" {
 		return health(ctx)
-	case req.Path == "/items" && req.HTTPMethod == "POST":
+	}
+	if req.Path != "/items" {
+		return respond(404, map[string]string{"error": "not found"})
+	}
+	if apiToken == "" {
+		slog.Error("API_TOKEN is not configured", "region", region)
+		return respond(503, map[string]string{"error": "authentication unavailable"})
+	}
+	if !authorized(req.Headers) {
+		return unauthorized()
+	}
+
+	switch req.HTTPMethod {
+	case "POST":
 		return putItem(ctx, req)
-	case req.Path == "/items" && req.HTTPMethod == "GET":
+	case "GET":
 		return queryItems(ctx, req)
 	default:
 		return respond(404, map[string]string{"error": "not found"})
 	}
+}
+
+func authorized(headers map[string]string) bool {
+	var authorization string
+	for name, value := range headers {
+		if strings.EqualFold(name, "Authorization") {
+			authorization = value
+			break
+		}
+	}
+
+	parts := strings.Fields(authorization)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+		return false
+	}
+	presentedHash := sha256.Sum256([]byte(parts[1]))
+	expectedHash := sha256.Sum256([]byte(apiToken))
+	return subtle.ConstantTimeCompare(presentedHash[:], expectedHash[:]) == 1
+}
+
+func unauthorized() (events.ALBTargetGroupResponse, error) {
+	response, err := respond(401, map[string]string{"error": "unauthorized"})
+	response.Headers["WWW-Authenticate"] = `Bearer realm="mrpoc"`
+	return response, err
 }
 
 // health is the entire failover signal. Global Accelerator does not probe ALB
@@ -228,6 +268,8 @@ func statusText(c int) string {
 		return "Created"
 	case 400:
 		return "Bad Request"
+	case 401:
+		return "Unauthorized"
 	case 404:
 		return "Not Found"
 	case 409:

@@ -39,6 +39,9 @@ func TestRegionalStackUsesPrivateGlobalAcceleratorEndpoint(t *testing.T) {
 	template.HasResourceProperties(jsii.String("AWS::EC2::VPCGatewayAttachment"), map[string]any{
 		"InternetGatewayId": map[string]any{"Ref": assertions.Match_AnyValue()},
 	})
+	template.HasOutput(jsii.String("LambdaName"), map[string]any{
+		"Value": assertions.Match_AnyValue(),
+	})
 }
 
 func TestPrimaryStackSynthesizesMRSCGlobalTable(t *testing.T) {

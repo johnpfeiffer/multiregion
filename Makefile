@@ -25,6 +25,7 @@ help:
 	@echo "Local:   make setup | make build | make test | make synth"
 	@echo "Dynamo:  make local-up | make test-integration | make local-down"
 	@echo "AWS:     make bootstrap | make deploy | make accel-dns | make accel-ips"
+	@echo "Auth:    scripts/set-api-token.sh [API_TOKEN]"
 	@echo "Options: AWS_PROFILE=<profile> ACCOUNT=<12-digit-account-id>"
 	@echo "HTTPS:   $(DOMAIN_NAME) (override CERT_ARN_USW2 / CERT_ARN_USE1 if needed)"
 
@@ -70,6 +71,7 @@ test-integration: local-up lambda-deps
 		AWS_EC2_METADATA_DISABLED=true \
 		TABLE_NAME=$(LOCAL_TABLE) \
 		DYNAMODB_ENDPOINT=$(DYNAMODB_ENDPOINT) \
+		API_TOKEN=local-integration-token-32-characters \
 		go test -tags=integration -count=1 .
 
 fmt:
@@ -111,6 +113,7 @@ deploy-edge: check-aws build infra-deps node-deps
 deploy:
 	$(MAKE) deploy-regions
 	$(MAKE) deploy-edge
+	@echo "Deployment complete. Run scripts/set-api-token.sh to set API_TOKEN on both regional Lambdas."
 
 accel-dns: check-aws
 	@aws globalaccelerator list-accelerators --region $(PRIMARY) \

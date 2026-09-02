@@ -22,6 +22,7 @@ Install:
 - Go 1.25 or newer
 - Node.js 22 or 24 and npm
 - AWS CLI v2
+- `jq` (used by the API token configuration helper)
 - Docker Desktop (only for the DynamoDB Local integration test)
 
 The AWS CDK CLI is pinned as a project dependency, so a global `cdk` installation is not required.
@@ -46,7 +47,7 @@ aws sso login --profile my-profile
 AWS_PROFILE=my-profile aws sts get-caller-identity
 ```
 
-The deployment identity needs permission to bootstrap and deploy CDK stacks containing IAM, VPC, ALB, Lambda, DynamoDB global table, and Global Accelerator resources. It also needs permission to read CloudFormation stack outputs.
+The deployment identity needs permission to bootstrap and deploy CDK stacks containing IAM, VPC, ALB, Lambda, DynamoDB global table, and Global Accelerator resources. It also needs permission to read CloudFormation stack outputs. The token helper additionally uses `lambda:GetFunctionConfiguration` and `lambda:UpdateFunctionConfiguration`.
 
 All AWS-facing Make targets honor `AWS_PROFILE`. They discover the account through STS, or you can provide `ACCOUNT` explicitly. If the explicit account does not match the authenticated account, the Makefile stops before deployment.
 
@@ -121,6 +122,7 @@ AWS_SECRET_ACCESS_KEY=local \
 AWS_EC2_METADATA_DISABLED=true \
 TABLE_NAME=mrpoc-items-local \
 DYNAMODB_ENDPOINT=http://localhost:8000 \
+API_TOKEN=local-integration-token-32-characters \
 go test -tags=integration -count=1 .
 ```
 
@@ -153,6 +155,28 @@ AWS_PROFILE=my-profile make deploy
 
 `make deploy` validates the authenticated account and refuses to create the edge stack if it cannot obtain a valid `us-east-1` ALB ARN.
 
+### Configure API authentication
+
+`/items` requires an `Authorization: Bearer <token>` header. `/healthz` remains public so the ALB can perform health checks. The Lambda fails closed with `503` if `API_TOKEN` has not been configured and returns `401` for a missing or incorrect token.
+
+After each deployment, run the helper and enter a token of at least 32 characters at its hidden prompt:
+
+```sh
+AWS_PROFILE=my-profile scripts/set-api-token.sh
+```
+
+For example, generate a high-entropy token in another terminal with `openssl rand -hex 32`. The script accepts the token as a parameter if needed:
+
+```sh
+API_TOKEN="$(openssl rand -hex 32)"
+AWS_PROFILE=my-profile scripts/set-api-token.sh "$API_TOKEN"
+unset API_TOKEN
+```
+
+The prompt form is preferable because it does not put the token in a command argument. The helper discovers both function names from the `Svc-usw2` and `Svc-use1` CloudFormation outputs, preserves the other Lambda environment variables, updates `API_TOKEN`, and waits for both changes to finish. Do not commit a real token.
+
+This is deliberately simple runtime configuration for the current milestone. CDK owns the Lambda environment map, so a later `make deploy` will remove this out-of-band value; rerun the helper after every deployment. For production, move the token to AWS Secrets Manager or replace shared-token authentication with a proper identity system.
+
 Get the Global Accelerator hostname:
 
 ```sh
@@ -172,7 +196,9 @@ Then create an A record for each returned address.
 Write an item through Global Accelerator:
 
 ```sh
+export API_TOKEN='replace-with-the-deployed-token'
 curl -i -X POST "https://www.example.com/items" \
+  -H "Authorization: Bearer ${API_TOKEN}" \
   -H 'Content-Type: application/json' \
   -d '{"id":"demo","seq":1,"payload":"hello"}'
 ```
@@ -180,7 +206,8 @@ curl -i -X POST "https://www.example.com/items" \
 Read the item through Global Accelerator:
 
 ```sh
-curl -i "https://www.example.com/items?id=demo"
+curl -i "https://www.example.com/items?id=demo" \
+  -H "Authorization: Bearer ${API_TOKEN}"
 ```
 
 The responses include `X-Served-By`, which identifies the AWS Region that handled each request.
@@ -190,6 +217,7 @@ To test before the `www` CNAME has propagated, resolve the HTTPS hostname to one
 ```sh
 ACCELERATOR_DNS="$(AWS_PROFILE=my-profile make accel-dns)"
 curl -i "https://www.example.com/items?id=demo" \
+  -H "Authorization: Bearer ${API_TOKEN}" \
   --resolve "www.example.com:443:$(dig +short "$ACCELERATOR_DNS" | head -1)"
 ```
 
@@ -222,7 +250,8 @@ Change `--region` to `us-east-1` to inspect the other replica.
 
 - Public requests use HTTPS, with TLS 1.2 or 1.3 terminated independently at each regional ALB.
 - The authoritative DNS record for `www.example.com` is external to this CDK application.
-- The API is intentionally minimal and unauthenticated.
+- The API uses one shared bearer token for `/items`; it does not provide per-user identity, authorization scopes, token expiry, or rate limiting.
+- `/healthz` is intentionally unauthenticated for ALB health checks.
 - The DynamoDB table has a destroy removal policy. Treat deployed data as disposable.
 - Global Accelerator, two ALBs, Lambda invocations, and DynamoDB usage can incur AWS charges.
 - Failover and failback controls are intentionally deferred to the next milestone.
@@ -236,6 +265,7 @@ These are the canonical sources behind the current design and local workflow:
 - Global Accelerator: [standard accelerator endpoints](https://docs.aws.amazon.com/global-accelerator/latest/dg/about-endpoints.html), [secure VPC connections](https://docs.aws.amazon.com/global-accelerator/latest/dg/secure-vpc-connections.html), and [private-subnet/client-IP requirements](https://docs.aws.amazon.com/global-accelerator/latest/dg/about-endpoints.sipp-caveats.html). AWS requires an internet gateway attached to a VPC containing a private ALB endpoint, but it does not require public IPs or an internet-gateway route on the private subnets.
 - HTTPS and DNS: [ALB HTTPS listeners](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/create-https-listener.html), [regional ACM certificates](https://docs.aws.amazon.com/acm/latest/userguide/acm-overview.html), and [mapping a custom domain to Global Accelerator](https://docs.aws.amazon.com/global-accelerator/latest/dg/dns-addressing-custom-domains.mapping-your-custom-domain.html).
 - Private ALB and Lambda: [using Lambda functions as ALB targets](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/lambda-functions.html), including the ALB event/response shape, direct Lambda invocation behavior, health checks, and payload limits.
+- Lambda configuration and authentication headers: [Lambda environment variables](https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html), [environment-variable encryption](https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars-encryption.html), and [ALB request headers in Lambda events](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/lambda-functions.html). AWS recommends Secrets Manager rather than environment variables for credentials such as API keys; the environment-variable approach here is a milestone tradeoff.
 - DynamoDB: [global tables and consistency modes](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GlobalTables.html), [creating MRSC global tables](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/V2globaltables.tutorial.html), and [global-table design guidance](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-global-table-design.html).
 - DynamoDB Local: [AWS's Docker and Docker Compose instructions](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.DownloadingAndRunning.html), [local usage notes and differences](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.UsageNotes.html), and [AWS SDK for Go v2 custom endpoint configuration](https://docs.aws.amazon.com/sdk-for-go/v2/developer-guide/configure-endpoints.html).
 - AWS CDK: [getting started with the CDK](https://docs.aws.amazon.com/cdk/v2/guide/getting-started.html) and [working with the CDK in Go](https://docs.aws.amazon.com/cdk/v2/guide/work-with-cdk-go.html).

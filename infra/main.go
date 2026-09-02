@@ -200,6 +200,7 @@ func NewRegionalStack(scope constructs.Construct, id string, props *RegionalStac
 
 	awscdk.NewCfnOutput(stack, jsii.String("AlbArn"), &awscdk.CfnOutputProps{Value: alb.LoadBalancerArn()})
 	awscdk.NewCfnOutput(stack, jsii.String("AlbDns"), &awscdk.CfnOutputProps{Value: alb.LoadBalancerDnsName()})
+	awscdk.NewCfnOutput(stack, jsii.String("LambdaName"), &awscdk.CfnOutputProps{Value: fn.FunctionName()})
 
 	return &RegionalStack{Stack: stack, Alb: alb}
 }

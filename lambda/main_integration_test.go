@@ -29,12 +29,26 @@ func TestHandlerWritesAndReadsDynamoDBLocal(t *testing.T) {
 	createLocalTable(t, ctx)
 
 	const (
-		id         = "integration-test"
-		occurredAt = "2026-09-01T12:00:00Z"
+		id                  = "integration-test"
+		occurredAt          = "2026-09-01T12:00:00Z"
+		integrationAPIToken = "local-integration-token-32-characters"
 	)
+	unauthorized, err := handler(ctx, events.ALBTargetGroupRequest{
+		HTTPMethod: "POST",
+		Path:       "/items",
+		Body:       fmt.Sprintf(`{"id":%q,"occurred_at":%q,"seq":41}`, id, occurredAt),
+	})
+	if err != nil {
+		t.Fatalf("unauthorized POST /items: %v", err)
+	}
+	if unauthorized.StatusCode != 401 {
+		t.Fatalf("unauthorized POST /items status = %d, body = %s", unauthorized.StatusCode, unauthorized.Body)
+	}
+
 	put, err := handler(ctx, events.ALBTargetGroupRequest{
 		HTTPMethod: "POST",
 		Path:       "/items",
+		Headers:    map[string]string{"authorization": "Bearer " + integrationAPIToken},
 		Body:       fmt.Sprintf(`{"id":%q,"occurred_at":%q,"seq":42,"payload":"local"}`, id, occurredAt),
 	})
 	if err != nil {
@@ -47,6 +61,7 @@ func TestHandlerWritesAndReadsDynamoDBLocal(t *testing.T) {
 	get, err := handler(ctx, events.ALBTargetGroupRequest{
 		HTTPMethod:            "GET",
 		Path:                  "/items",
+		Headers:               map[string]string{"Authorization": "Bearer " + integrationAPIToken},
 		QueryStringParameters: map[string]string{"id": id},
 	})
 	if err != nil {
